@@ -1,0 +1,841 @@
+# docker-compose.yml
+
+x-log-rotation: &log_rotation
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+      max-file: "${DOCKER_LOG_MAX_FILE:-3}"
+
+x-gluetun-rider: &gluetun_rider
+  network_mode: "service:gluetun"
+  depends_on:
+    gluetun:
+      condition: service_healthy
+
+#volumes:
+#  vw_data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # Password manager
+  # ---------------------------------------------------------------------------
+  vaultwarden:
+    <<: *log_rotation
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    user: "${VW_UID}:${VW_GID}"
+    environment:
+      TZ: ${TZ}
+      DOMAIN: "${VW_DOMAIN}"
+      SIGNUPS_ALLOWED: False
+      ADMIN_TOKEN: "${ADMIN_TOKEN}"
+    volumes:
+      - "./vw-data:/data"
+#      - vw_data:/to
+    ports:
+      - "${LAN_BIND_ADDR}:${VW_PORT}:80"
+    restart: unless-stopped
+    networks: [lan, internal]
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    ports:
+      - "3001:3000"
+      - "222:22"
+    volumes:
+      - ./gitea:/data
+
+  fileserver:
+    image: peterberweiler/fileserver
+    container_name: fileserver
+    user: "1001:1001"
+    environment:
+        # all of these are optional
+#      - BASEPATH=/
+      - BASIC_AUTH_ENABLED=false
+      - BASIC_AUTH_REALM=admin 
+      - BASIC_AUTH_USER=admin 
+      - BASIC_AUTH_PASSWORD=${FILESERVER_PASSWORD} 
+    volumes:
+      - ./fileserver/public:/public
+    ports:
+      - "8099:80"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # I2P
+  # ---------------------------------------------------------------------------
+#  i2p:
+#    <<: *log_rotation
+#    image: geti2p/i2p
+#    container_name: i2p
+#    environment:
+#      TZ: ${TZ}
+#      EXT_PORT: 7657
+#      JVM_XMX: "256m"
+#    ports:
+#      - "${LAN_BIND_ADDR}:4444:4444"     # HTTP proxy
+#      - "${LAN_BIND_ADDR}:6668:6668"     # IRC (optional)
+#      - 0.0.0.0:7657:7657     # Router console
+#      - "${I2P_TORRENT_PORT}:12345"      # inbound tcp
+#      - "${I2P_TORRENT_PORT}:12345/udp"  # inbound udp
+#    volumes:
+#      - "${I2P_CONFIG_DIR}:/i2p/.i2p"
+#      - "${I2P_SNARK_DIR}:/i2psnark"
+#    restart: unless-stopped
+#    network_mode: host
+#    networks: [lan, internal]
+
+# ACTUAL BUDGET
+
+  actual_server:
+    image: docker.io/actualbudget/actual-server:latest
+    ports:
+      # This line makes Actual available at port 5006 of the device you run the server on,
+      # i.e. http://localhost:5006. You can change the first number to change the port, if you want.
+      - '${LAN_BIND_ADDR}:5006:5006'
+    volumes:
+      # Change './actual-data' below to the path to the folder you want Actual to store its data in on your server.
+      # '/data' is the path Actual will look for its files in by default, so leave that as-is.
+      - ./actual-data:/data
+    healthcheck:
+      # Enable health check for the instance
+      test: ['CMD-SHELL', 'node src/scripts/health-check.js']
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+# Immich
+
+  immich-server:
+    container_name: immich_server
+    user: 1002:1002
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    # extends:
+    #   file: hwaccel.transcoding.yml
+    #   service: cpu # set to one of [nvenc, quicksync, rkmpp, vaapi, vaapi-wsl] for accelerated transcoding
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # Do not edit the next line. If you want to change the media storage location on your system, edit the value of UPLOAD_LOCATION in the .env file
+      - ${UPLOAD_LOCATION}:/data
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    ports:
+      - '${LAN_BIND_ADDR}:2283:2283'
+    depends_on:
+      - redis
+      - database
+    restart: always
+    healthcheck:
+      disable: false
+    networks: [lan, internal]
+
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    # For hardware acceleration, add one of -[armnn, cuda, rocm, openvino, rknn] to the image tag.
+    # Example tag: ${IMMICH_VERSION:-release}-cuda
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}
+    # extends: # uncomment this section for hardware acceleration - see https://docs.immich.app/features/ml-hardware-acceleration
+    #   file: hwaccel.ml.yml
+    #   service: cpu # set to one of [armnn, cuda, rocm, openvino, openvino-wsl, rknn] for accelerated inference - use the `-wsl` version for WSL2 where applicable
+    user: 1002:1002
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /personal/immich/conf/ml-dotcache:/.cache
+      - /personal/immich/conf/ml-config:/.config
+      - /personal/immich/conf/modelconfig:/config
+      - /personal/immich/conf/modelcache:/cache
+    env_file:
+      - .env
+    restart: always
+    healthcheck:
+      disable: false
+    networks: [lan, internal]
+
+  redis:
+    container_name: immich_redis
+    image: docker.io/valkey/valkey:9@sha256:546304417feac0874c3dd576e0952c6bb8f06bb4093ea0c9ca303c73cf458f63
+    user: 1002:1002
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /personal/immich/conf/redis:/data
+    healthcheck:
+      test: redis-cli ping || exit 1
+    restart: always
+    networks: [lan, internal]
+
+  database:
+    container_name: immich_postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    user: 1002:1002
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+      # Uncomment the DB_STORAGE_TYPE: 'HDD' var if your database isn't stored on SSDs
+#      DB_STORAGE_TYPE: 'HDD'
+    volumes:
+      # Do not edit the next line. If you want to change the database storage location on your system, edit the value of DB_DATA_LOCATION in the .env file
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+    shm_size: 128mb
+    restart: always
+    healthcheck:
+      disable: false
+    networks: [lan, internal]
+
+# Mealie
+
+  mealie:
+    image: ghcr.io/mealie-recipes/mealie:v3.11.0 # 
+    container_name: mealie
+    restart: always
+    ports:
+        - "9925:9000" # 
+    deploy:
+      resources:
+        limits:
+          memory: 1000M # 
+    volumes:
+      - ./mealie/data:/app/data/
+    environment:
+      # Set Backend ENV Variables Here
+      ALLOW_SIGNUP: "true"
+      PUID: 1000
+      PGID: 1000
+      TZ: America/New_York
+      BASE_URL: https://mealie.sandstorm.chat
+      # Database Settings
+      DB_ENGINE: postgres
+      POSTGRES_USER: mealie
+      POSTGRES_PASSWORD: mealie
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: mealie
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    container_name: postgres
+    image: postgres:17
+    restart: always
+    volumes:
+      - ./mealie/postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: mealie
+      POSTGRES_USER: mealie
+      PGUSER: mealie
+      POSTGRES_DB: mealie
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+
+  # ---------------------------------------------------------------------------
+  # Gluetun (VPN gateway)
+  # ---------------------------------------------------------------------------
+  gluetun:
+    <<: *log_rotation
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      TZ: ${TZ}
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER}
+      VPN_TYPE: ${VPN_TYPE}
+      FIREWALL_VPN_INPUT_PORTS: "${QBIT_PORT},${SLSKD_PORT},${QBIT_AUTODL_PORT},${BITMAGNET_P2P_PORT}"
+      HTTPPROXY: "on"
+      HTTPPROXY_LISTENING_ADDRESS: ":8888"
+#      HTTPPROXY: ${GLUETUN_HTTPPROXY_MODE}
+    volumes:
+      - "${GLUETUN_CONFIG_DIR}:/gluetun"
+    ports:
+      - "8888:8888"
+      - "${LAN_BIND_ADDR}:${GLUETUN_WEBUI_PORT}:8080"
+
+      # qBittorrent web UIs live behind gluetun netns
+      - "${LAN_BIND_ADDR}:${QBIT_WEBUI_PORT}:${QBIT_WEBUI_PORT}"
+      - "${LAN_BIND_ADDR}:${QBIT_AUTODL_WEBUI_PORT}:${QBIT_AUTODL_WEBUI_PORT}"
+
+      # SLSKD WEBUI
+      - "${LAN_BIND_ADDR}:${EXTRA_PORT_1}:50393"
+      - "${LAN_BIND_ADDR}:${EXTRA_PORT_2}:${EXTRA_PORT_2}"
+
+      # BITMAGNET 
+      - "${LAN_BIND_ADDR}:${BITMAGNET_PORT}:${BITMAGNET_PORT}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 5 -O- https://ipinfo.io/ip >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 8s
+      retries: 6
+      start_period: 25s
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # MAM seedboxapi (rides gluetun)
+  # ---------------------------------------------------------------------------
+  seedboxapi:
+    <<: [*log_rotation, *gluetun_rider]
+    image: myanonamouse/seedboxapi
+    container_name: seedboxapi
+    user: ${PUID}:${PGID}
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      DEBUG: ${SEEDBOXAPI_DEBUG}
+      mam_id: ${MAM_ID}
+      interval: ${SEEDBOXAPI_INTERVAL}
+    volumes:
+      - "${SEEDBOXAPI_CONFIG_DIR}:/config"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Soulseek (rides gluetun)
+  # ---------------------------------------------------------------------------
+  slskd:
+    <<: [*log_rotation, *gluetun_rider]
+    image: slskd/slskd:latest
+    container_name: slskd
+    user: ${PUID}:${PGID}
+    environment:
+      TZ: ${TZ}
+#      PUID: ${PUID}
+#      PGID: ${PGID}
+      SLSKD_REMOTE_CONFIGURATION: "true"
+    volumes:
+      - "${SLSKD_CONFIG_DIR}:/app"
+      - "${MEDIA_DATA_DIR}:/data"
+      - "${NVME_TORRENTS_DIR}:/temp"
+#      - "/nvme/slskdtmp:/tmp"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # qBittorrent (LinuxServer, s6) — DO NOT set user:, DO NOT set init:
+  # ---------------------------------------------------------------------------
+  qbittorrent:
+    <<: [*log_rotation, *gluetun_rider]
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+      WEBUI_PORT: ${QBIT_WEBUI_PORT}
+      TORRENTING_PORT: ${QBIT_PORT}
+      WEBUI_ADDRESS: "0.0.0.0"
+      DNS1: ${DNS1}
+      DNS2: ${DNS2}
+    volumes:
+      - "${QBIT_CONFIG_DIR}:/config"
+      - "${MEDIA_DATA_DIR}:/data"
+      - "${NVME_TORRENTS_DIR}:/temp"
+    restart: unless-stopped
+
+  qbittorrentautodl:
+    <<: [*log_rotation, *gluetun_rider]
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrentautodl
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+      WEBUI_PORT: ${QBIT_AUTODL_WEBUI_PORT}
+      TORRENTING_PORT: ${QBIT_AUTODL_PORT}
+      WEBUI_ADDRESS: "0.0.0.0"
+      DNS1: ${DNS1}
+      DNS2: ${DNS2}
+    volumes:
+      - "${QBIT2_CONFIG_DIR}:/config"
+      - "${MEDIA_DATA_DIR}:/data"
+      - "${NVME_TORRENTS_DIR}:/temp"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Bitmagnet
+  # ---------------------------------------------------------------------------
+  bitmagnet:
+    <<: [*log_rotation, *gluetun_rider]
+    image: ghcr.io/bitmagnet-io/bitmagnet:latest
+    container_name: bitmagnet
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+
+      # Database
+      POSTGRES_HOST: bitmagnet-postgres
+      POSTGRES_DB: ${BITMAGNET_DB:-bitmagnet}
+      POSTGRES_USER: ${BITMAGNET_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${BITMAGNET_DB_PASSWORD}
+
+      # Optional
+      # TMDB_API_KEY: ${TMDB_API_KEY}
+
+#    ports:
+#      # API + WebUI
+#      # DHT / BitTorrent
+#      - "${LAN_BIND_ADDR}:${BITMAGNET_P2P_PORT:-3334}:3334/tcp"
+#      - "${LAN_BIND_ADDR}:${BITMAGNET_P2P_PORT:-3334}:3334/udp"
+
+    volumes:
+      - "${BITMAGNET_CONFIG_DIR}:/root/.config/bitmagnet"
+
+    command:
+      - worker
+      - run
+      - --keys=http_server
+      - --keys=queue_server
+      - --keys=dht_crawler
+
+    depends_on:
+      bitmagnet-postgres:
+        condition: service_healthy
+
+    healthcheck:
+      # If bitmagnet exposes a health endpoint, swap this to that.
+      # This at least verifies the web server is responding on 3333.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3333/ || exit 1"]
+      start_period: 25s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+
+    restart: unless-stopped
+#    networks: [lan, internal]
+
+
+  # ---------------------------------------------------------------------------
+  # Bitmagnet Postgres
+  # ---------------------------------------------------------------------------
+  bitmagnet-postgres:
+    <<: *log_rotation
+    image: postgres:16-alpine
+    container_name: bitmagnet-postgres
+    environment:
+      TZ: ${TZ}
+      POSTGRES_DB: ${BITMAGNET_DB:-bitmagnet}
+      POSTGRES_USER: ${BITMAGNET_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${BITMAGNET_DB_PASSWORD}
+
+    shm_size: 1g
+
+    volumes:
+      - "${BITMAGNET_POSTGRES_DIR}:/var/lib/postgresql/data"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB || exit 1"]
+      start_period: 20s
+      timeout: 5s
+      interval: 10s
+      retries: 10
+
+    restart: unless-stopped
+    networks: [internal]
+
+  # ---------------------------------------------------------------------------
+  # Qui (not s6; runs fine as PUID/PGID env)
+  # ---------------------------------------------------------------------------
+  qui:
+    <<: *log_rotation
+    image: ghcr.io/autobrr/qui:latest
+    container_name: qui
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+    ports:
+      - "${LAN_BIND_ADDR}:${QUI_PORT}:7476"
+    volumes:
+      - "${QUI_CONFIG_DIR}:/config"
+      - "${MEDIA_DATA_DIR}:/data"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # Arr stack (LinuxServer / s6) — DO NOT set user:, DO NOT set init:
+  # ---------------------------------------------------------------------------
+  lidarr:
+    <<: *log_rotation
+    image: ghcr.io/linuxserver-labs/prarr:lidarr-plugins
+    container_name: lidarr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+    volumes:
+      - "${LIDARR_CONFIG_DIR}:/config"
+      - "${MEDIA_DATA_DIR}:/data"
+      - "${LIDARR_CACHE_DIR}:/cache"
+#      - "/usr/bin/ffmpeg:/usr/bin/ffmpeg:ro"
+    ports:
+      - "${LAN_BIND_ADDR}:${LIDARR_PORT}:8686"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  radarr:
+    <<: *log_rotation
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+    volumes:
+      - "${RADARR_CONFIG_DIR}:/config"
+      - "${MEDIA_DATA_DIR}:/data"
+    ports:
+      - "${LAN_BIND_ADDR}:${RADARR_PORT}:7878"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  sonarr:
+    <<: *log_rotation
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      TZ: ${SONARR_TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+    volumes:
+      - "${SONARR_CONFIG_DIR}:/config"
+      - "${MEDIA_DATA_DIR}:/data"
+    ports:
+      - "${LAN_BIND_ADDR}:${SONARR_PORT}:8989"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  prowlarr:
+    <<: *log_rotation
+    image: ghcr.io/hotio/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PROWLARR_PUID}
+      PGID: ${PROWLARR_PGID}
+      UMASK: ${UMASK}
+      WEBUI_PORTS: "9696/tcp"
+    volumes:
+      - "${PROWLARR_CONFIG_DIR}:/config"
+    ports:
+      - "${LAN_BIND_ADDR}:${PROWLARR_PORT}:9696"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  flaresolverr:
+    <<: *log_rotation
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      TZ: ${TZ}
+      LOG_LEVEL: ${FLARE_LOG_LEVEL}
+      LOG_FILE: ${FLARE_LOG_FILE}
+      LOG_HTML: ${FLARE_LOG_HTML}
+      CAPTCHA_SOLVER: ${FLARE_CAPTCHA_SOLVER}
+    ports:
+      - "${LAN_BIND_ADDR}:${FLARE_PORT}:8191"
+    volumes:
+      - "${FLARE_CONFIG_DIR}:/config"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  recyclarr:
+    <<: *log_rotation
+    image: ghcr.io/recyclarr/recyclarr:latest
+    container_name: recyclarr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+    volumes:
+      - "${RECYCLARR_CONFIG_DIR}:/config"
+    restart: unless-stopped
+    networks: [internal]
+
+  autobrr:
+    <<: *log_rotation
+    image: ghcr.io/autobrr/autobrr:latest
+    container_name: autobrr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+    volumes:
+      - "${AUTOBRR_CONFIG_DIR}:/config"
+    ports:
+      - "${LAN_BIND_ADDR}:${AUTOBRR_PORT}:7474"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+#  cross-seed:
+#    <<: *log_rotation
+#    image: ghcr.io/cross-seed/cross-seed:6
+#    container_name: cross-seed
+#    environment:
+#      TZ: ${TZ}
+#      PUID: ${PUID}
+#      PGID: ${PGID}
+#    ports:
+#      - "${LAN_BIND_ADDR}:${CROSSEED_PORT}:2468"
+#    volumes:
+#      - "${CROSSEED_CONFIG_DIR}:/config"
+#      - "${MEDIA_DATA_DIR}:/data"
+#      - "${NVME_TORRENTS_DIR}:/temp"
+#    command: daemon
+#    restart: unless-stopped
+#    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # Media
+  # ---------------------------------------------------------------------------
+  navidrome:
+    <<: *log_rotation
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      ND_LASTFM_ENABLED: ${ND_LASTFM_ENABLED}
+      ND_LASTFM_APIKEY: ${LAST_FM_KEY}
+      ND_LASTFM_SECRET: ${LAST_FM_SECRET}
+      ND_SCANNER_SCHEDULE: "0 0 * * *"
+      ND_ENABLESHARING: True
+      ND_PLUGINS_ENABLED: True
+    volumes:
+      - "${NAVIDROME_DATA_DIR}:/data"
+      - "${MUSIC_DIR}:/music:ro"
+    ports:
+      - "${LAN_BIND_ADDR}:${NAVIDROME_PORT}:4533"
+    restart: unless-stopped
+    networks: [lan, internal]
+  
+#  magiclists:
+#     image: rickysynnot/magic-lists-for-navidrome:latest
+#     container_name: magiclists
+#     ports:
+#       - "4545:8000"
+#     environment:
+#       - NAVIDROME_URL=http://navidrome:4533
+#       - NAVIDROME_USERNAME=your_username
+#       - NAVIDROME_PASSWORD=your_password
+#       - DATABASE_PATH=/app/data/magiclists.db # Required: Database location
+#       - AI_PROVIDER=openrouter               # Optional: openrouter, groq, google, ollama
+#       - AI_API_KEY=your_openrouter_api_key  # Optional, for OpenRouter/Groq/Google
+#       - AI_MODEL=meta-llama/llama-3.3-70b-instruct # Optional, for AI providers
+#     volumes:
+#       - ./magiclists-data:/app/data          # Persist configuration
+#     restart: unless-stopped
+
+  jellyfin:
+    <<: *log_rotation
+    image: ghcr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+      JELLYFIN_PublishedServerUrl: ${JELLYFIN_PUBLISHED_URL}
+    group_add:
+      - '987'
+      - '983'
+    ports:
+      - "${LAN_BIND_ADDR}:${JELLYFIN_PORT}:8096"
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    volumes:
+      - "${JELLYFIN_CONFIG_DIR}:/config"
+      - "${MEDIA_DIR}:/media"
+      - /nvme/xdg/cache:/cache
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  jellyseerr:
+    <<: *log_rotation
+    image: ghcr.io/fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      LOG_LEVEL: debug
+      PORT: ${JELLYSEER_PORT}
+    ports:
+      - "${LAN_BIND_ADDR}:${JELLYSEER_PORT}:5055"
+    volumes:
+      - "${JELLYSEER_CONFIG_DIR}:/app/config"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/status || exit 1"]
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # IRC web client
+  # ---------------------------------------------------------------------------
+  thelounge:
+    <<: *log_rotation
+    image: ghcr.io/thelounge/thelounge:latest
+    container_name: thelounge
+    user: "${THELOUNGE_UID}:${THELOUNGE_GID}"
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - "${THELOUNGE_DATA_DIR}:/var/opt/thelounge"
+    ports:
+      - "${LAN_BIND_ADDR}:${THELOUNGE_PORT}:9000"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # Arcane
+  # ---------------------------------------------------------------------------
+  arcane:
+    <<: *log_rotation
+    image: ghcr.io/getarcaneapp/arcane:latest
+    container_name: arcane
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      APP_URL: ${ARCANE_APP_URL}
+      ENCRYPTION_KEY: ${ARCANE_ENCRYPTION_KEY}
+      JWT_SECRET: ${ARCANE_JWT_SECRET}
+    ports:
+      - "${LAN_BIND_ADDR}:${ARCANE_PORT}:3552"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "${ARCANE_DATA_DIR}:/app/data"
+      - "${ARCANE_PROJECTS_DIR}:/opt/projects"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # Dispatcharr (no redis container; uses your env values)
+  # ---------------------------------------------------------------------------
+  dispatcharr:
+    <<: *log_rotation
+    image: ghcr.io/dispatcharr/dispatcharr:latest
+    container_name: dispatcharr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+      DISPATCHARR_ENV: ${DISPATCHARR_ENV}
+      REDIS_HOST: ${DISPATCHARR_REDIS_HOST}
+      CELERY_BROKER_URL: ${DISPATCHARR_CELERY_BROKER_URL}
+      DISPATCHARR_LOG_LEVEL: ${DISPATCHARR_LOG_LEVEL}
+      UWSGI_NICE_LEVEL: ${DISPATCHARR_UWSGI_NICE_LEVEL}
+      CELERY_NICE_LEVEL: ${DISPATCHARR_CELERY_NICE_LEVEL}
+    ports:
+      - "${LAN_BIND_ADDR}:${DISPATCHARR_PORT}:9191"
+    volumes:
+      - "${DISPATCHARR_DATA_DIR}:/data"
+    cap_add:
+      - SYS_NICE
+    group_add:
+      - '987'
+      - '983'
+    devices:
+      - /dev/dri:/dev/dri
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # Teamarr
+  # ---------------------------------------------------------------------------
+  teamarr:
+    <<: *log_rotation
+    image: ghcr.io/pharaoh-labs/teamarr:latest
+    container_name: teamarr
+    environment:
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+    ports:
+      - "${LAN_BIND_ADDR}:${TEAMARR_PORT}:9195"
+    volumes:
+      - "${TEAMARR_DATA_DIR}:/app/data"
+    restart: unless-stopped
+    networks: [lan, internal]
+
+  # ---------------------------------------------------------------------------
+  # Watchtower
+  # ---------------------------------------------------------------------------
+  watchtower:
+    <<: *log_rotation
+    image: nickfedor/watchtower:latest
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    networks: [lan, internal]
+#
+# BGUTIL PROVIDER
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: bgutil-provider
+    init: true
+    restart: unless-stopped
+    ports:
+      - "4416:4416"
+    networks: [lan,internal]
+  
+  scrutiny:
+    restart: unless-stopped
+    container_name: scrutiny
+    image: ghcr.io/analogj/scrutiny:master-omnibus
+    cap_add:
+      - SYS_RAWIO
+    ports:
+      - "${LAN_BIND_ADDR}:${SCRUTINY_PORT}:8080" # webapp
+      - "${LAN_BIND_ADDR}:${SCRUTINY_INFLUX}:8086" # influxDB admin
+    volumes:
+      - /run/udev:/run/udev:ro
+      - ${SCRUTINY_CONFIG_DIR}:/opt/scrutiny/config
+      - ${SCRUTINY_INFLUX_DIR}:/opt/scrutiny/influxdb
+    environment:
+      TZ: ${TZ}
+      PUID: 1001
+      PGID: 1001
+      COLLECTOR_CRON_SCHEDULE: "0 0 * * *"
+    devices:
+      - "/dev/sda"
+      - "/dev/sdb"
+      - "/dev/sdc"
+#      - "/dev/sdd"
+#      - "/dev/sde"
+      - "/dev/nvme0n1"
+    networks: [lan,internal]
+
+networks:
+  lan:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
